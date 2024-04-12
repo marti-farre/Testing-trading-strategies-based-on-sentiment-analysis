@@ -1,0 +1,357 @@
+---
+title: "exercise1"
+format: html
+editor: visual
+---
+
+## Code
+
+Set working directory to current script's location:
+
+```{r}
+fileloc <- dirname(rstudioapi::getSourceEditorContext()$path)
+setwd(fileloc)
+rm(fileloc)
+```
+
+Import libraries:
+
+```{r}
+library(xts)
+library(zoo)
+library(quantmod) # data, plotting, quant modelling
+library(PerformanceAnalytics) # performance and risk management
+library(matrixStats)
+library(doParallel)
+```
+
+Load and setup Google data:
+
+```{r}
+##frequency of sampling
+x <- read.csv('dataSent/GOOG.csv', sep = ",", header = TRUE)
+x<-x[,-1]
+
+##use Date as index
+goog <- as.xts(zoo(as.matrix(x[,-1]), as.Date(as.character(x[,1]))))
+
+## Target :  Adj.Close Price 
+goog_target <- goog$Adj.Close
+names(goog_target) <- "GOOG"
+```
+
+Load and setup Microsoft data:
+
+```{r}
+##frequency of sampling
+x <- read.csv('dataSent/MSFT.csv', sep = ",", header = TRUE)
+x<-x[,-1]
+
+##use Date as index
+msft <- as.xts(zoo(as.matrix(x[,-1]), as.Date(as.character(x[,1]))))
+
+## Target :  Adj.Close Price 
+msft_target <- msft$Adj.Close
+names(msft_target) <- "MSFT"
+```
+
+Google indicators for use in trade-signals:
+
+```{r}
+# Bearish sentiment indicators
+negativeP= na.omit(goog$negativePartscr)
+uncertaintyP= na.omit(goog$uncertaintyPartscr)
+findownP= na.omit(goog$findownPartscr)
+
+# Bullish sentiment indicators
+positiveP= na.omit(goog$positivePartscr)
+certaintyP= na.omit(goog$certaintyPartscr)
+finupP= na.omit(goog$finupPartscr)
+
+# Combinations
+BULL = .33*(positiveP+certaintyP+finupP); 
+BEAR= .33*(negativeP+uncertaintyP+findownP); 
+# Bull-Bear ratio: NAs are interpolated with leftmost and rightmost non-NA value
+##(NAs can be produced when BULL=BEAR=0)
+goog_BBr<- na.fill(100*BULL/(BULL+BEAR),"extend")
+names(goog_BBr)<-"GOOG_BBr"
+
+# Volume of news
+goog_RVT = na.omit(goog$RVT)
+names(goog_RVT)<-"GOOG_RVT"
+```
+
+Microsoft indicators for use in trade-signals:
+
+```{r}
+# Bearish sentiment indicators
+negativeP= na.omit(msft$negativePartscr)
+uncertaintyP= na.omit(msft$uncertaintyPartscr)
+findownP= na.omit(msft$findownPartscr)
+
+# Bullish sentiment indicators
+positiveP= na.omit(msft$positivePartscr)
+certaintyP= na.omit(msft$certaintyPartscr)
+finupP= na.omit(msft$finupPartscr)
+
+# Combinations
+BULL = .33*(positiveP+certaintyP+finupP); 
+BEAR= .33*(negativeP+uncertaintyP+findownP); 
+# Bull-Bear ratio: NAs are interpolated with leftmost and rightmost non-NA value
+##(NAs can be produced when BULL=BEAR=0)
+msft_BBr<- na.fill(100*BULL/(BULL+BEAR),"extend")
+names(msft_BBr)<-"MSFT_BBr"
+
+# Volume of news
+msft_RVT = na.omit(msft$RVT)
+names(msft_RVT)<-"MSFT_RVT"
+```
+
+Performance Measures for Trading strategies:
+
+```{r}
+Performance <- function(x,ntrades=1,cost=0) {
+  cumRetx = Return.cumulative(x,geometric = TRUE) -ntrades*cost
+  #annRetx = Return.annualized(x, scale=252,geometric = T) -ntrades*cost
+  annRetx = (cumRetx +1)^{252/length(x)} -1
+  #sharpex = SharpeRatio.annualized(x, scale=252)
+  sharpex = annRetx/sd.annualized(x,scale=252)
+  winpctx = length(x[x > 0])/length(x[x != 0])
+  annSDx = sd.annualized(x, scale=252)
+  DDs <- findDrawdowns(x)
+  maxDDx = min(DDs$return)
+  maxLx = max(DDs$length)
+  
+  Perf = c(cumRetx, annRetx, sharpex, winpctx, annSDx, maxDDx, maxLx, ntrades)
+  names(Perf) = c("Cumulative Return", "Annual Return","Annualized Sharpe Ratio","Win %", 
+                  "Annualized Volatility", "Maximum Drawdown", "Max Length Drawdown","n.trades")
+  return(Perf)
+}
+```
+
+BBr-based strategy:
+
+```{r}
+testBBrStrategy <- function(myStock, BBr, RVT, bbr_threshold = 1, rvt_threshold = 0, longshort = 0, tcost = 0) {
+  
+  # Generate signals based on Bull-Bear ratio threshold
+  myPosition <- sig <- Lag(ifelse(BBr > bbr_threshold & RVT > rvt_threshold, 1, ifelse(BBr < (1/bbr_threshold), -1, longshort)), 1)
+
+# Calculate returns
+  bmkReturns <- dailyReturn(myStock, type = "arithmetic")
+  myReturns <- bmkReturns * myPosition
+  
+  # Rename columns
+  names(bmkReturns) <- 'BH'
+  names(myReturns) <- 'BBr'
+  
+  # Merge returns and remove NA values
+  tt <- na.omit(merge(bmkReturns, myReturns))
+  
+  # Calculate performance
+  cbind(BBr = Performance(tt$BBr, cost = tcost), BH = Performance(tt$BH, 2, tcost))
+}
+```
+
+Rolling window analysis for BBr-based strategy:
+
+```{r}
+RollingTestBBrStrategy <- function(myStock, BBr, RVT, bbr_threshold = 1, rvt_threshold = 0, longshort = 0, w_size = 252) {
+  # Generate signals based on Bull-Bear ratio threshold
+  myPosition <- sig <- Lag(ifelse(BBr > bbr_threshold & RVT > rvt_threshold, 1, ifelse(BBr < (1/bbr_threshold), -1, longshort)), 1)
+  
+  # Calculate returns
+  bmkReturns <- dailyReturn(myStock, type = "arithmetic")
+  myReturns <- bmkReturns * myPosition
+  
+  # Rename columns
+  names(bmkReturns) <- 'BH'
+  names(myReturns) <- 'BBr'
+  
+  # Merge returns and remove NA values
+  tt <- na.omit(merge(bmkReturns, myReturns))
+  
+  n_windows = nrow(tt) - w_size
+  if (n_windows < 1) stop("Window size too large")
+  
+  # Perform rolling window analysis
+  perform = foreach(i = 1:n_windows, .combine = rbind) %do% {
+    bhStra = tt$BH[i:(w_size + i - 1), ]
+    bbrStra = tt$BBr[i:(w_size + i - 1), ]
+    per = rbind(BH = Performance(bhStra), BBr = Performance(bbrStra))
+    return(per)
+  }
+  
+  bhindx = seq(1, 2 * n_windows, 2)
+  bbrindx = seq(2, 2 * n_windows, 2)
+  BHmeans = colMeans(perform[bhindx, ])
+  BBrMeans = colMeans(perform[bbrindx, ])
+  MeanPerf = rbind(BHmeans, BBrMeans)
+  colnames(MeanPerf) = colnames(perform)
+  rownames(MeanPerf) = c("BH", "BBr")
+  
+  return(list("AvgPerf" = MeanPerf, "NumWindows" = n_windows))
+}
+```
+
+Define hyper parameter values for testing:
+
+```{r}
+bbr_threshold_values <- list(5, 25)
+rvt_threshold_values <- list(0, 0.0005)
+longshort_values <- list(0, -1)
+tcost_values <- list(0, 0.01, 0.05)
+w_size_values <- list(254, 254/2)
+```
+
+Test Performance of Trading strategy against BH for Google.
+
+```{r}
+##Full period test for each hyperparameter combination
+for (i in seq_along(bbr_threshold_values)) {
+  for (j in seq_along(rvt_threshold_values)) {
+    for (k in seq_along(longshort_values)) {
+      for (l in seq_along(tcost_values)) {
+        res <- testBBrStrategy(goog_target, goog_BBr, goog_RVT, bbr_threshold = bbr_threshold_values[[i]], rvt_threshold = rvt_threshold_values[[j]], longshort = longshort_values[[k]], tcost = tcost_values[[l]])
+        if(res[1, 1]-res[1, 2]>0) print(paste("BBr threshold =", bbr_threshold_values[[i]], "; RVT threshold =", rvt_threshold_values[[j]], "; longshort =", longshort_values[[k]], "; tcost =", tcost_values[[l]]))
+        if(res[1, 1]-res[1, 2]>0) print(paste("Excess return =", res[1, 1]-res[1, 2]))
+      }
+    }
+  }
+}
+```
+
+Test Performance of Trading strategy against BH for Microsoft.
+
+```{r}
+##Full period test for each hyperparameter combination
+for (i in seq_along(bbr_threshold_values)) {
+  for (j in seq_along(rvt_threshold_values)) {
+    for (k in seq_along(longshort_values)) {
+      for (l in seq_along(tcost_values)) {
+        res <- testBBrStrategy(msft_target, msft_BBr, msft_RVT, bbr_threshold = bbr_threshold_values[[i]], rvt_threshold = rvt_threshold_values[[j]], longshort = longshort_values[[k]], tcost = tcost_values[[l]])
+        if(res[1, 1]-res[1, 2]>0) print(paste("BBr threshold =", bbr_threshold_values[[i]], "; RVT threshold =", rvt_threshold_values[[j]], "; longshort =", longshort_values[[k]], "; tcost =", tcost_values[[l]]))
+        if(res[1, 1]-res[1, 2]>0) print(paste("Excess return =", res[1, 1]-res[1, 2]))
+      }
+    }
+  }
+}
+```
+
+Average Performance of BBr over fixed length periods (window_size= 1 yr, 6 mon) using Rolling windows for Google.
+
+```{r}
+##Full period test for each hyperparameter combination
+for (i in seq_along(bbr_threshold_values)) {
+  for (j in seq_along(rvt_threshold_values)) {
+    for (k in seq_along(longshort_values)) {
+      for (l in seq_along(w_size_values)) {
+        meanperf <- RollingTestBBrStrategy(goog_target, goog_BBr, goog_RVT, bbr_threshold = bbr_threshold_values[[i]], rvt_threshold = rvt_threshold_values[[j]], longshort = longshort_values[[k]], w_size = w_size_values[[l]])
+        if(meanperf$AvgPerf[2, 1]-meanperf$AvgPerf[1, 1]>0) print(paste("BBr threshold =", bbr_threshold_values[[i]], "; RVT threshold =", rvt_threshold_values[[j]], "; longshort =", longshort_values[[k]], "; Window Size =", w_size_values[[l]]))
+        if(meanperf$AvgPerf[2, 1]-meanperf$AvgPerf[1, 1]>0) print(paste("Excess return =", meanperf$AvgPerf[2, 1]-meanperf$AvgPerf[1, 1]))
+      }
+    }
+  }
+}
+```
+
+Average Performance of BBr over fixed length periods (window_size= 1 yr, 6 mon) using Rolling windows for Microsoft.
+
+```{r}
+##Full period test for each hyperparameter combination
+for (i in seq_along(bbr_threshold_values)) {
+  for (j in seq_along(rvt_threshold_values)) {
+    for (k in seq_along(longshort_values)) {
+      for (l in seq_along(w_size_values)) {
+        meanperf <- RollingTestBBrStrategy(msft_target, msft_BBr, msft_RVT, bbr_threshold = bbr_threshold_values[[i]], rvt_threshold = rvt_threshold_values[[j]], longshort = longshort_values[[k]], w_size = w_size_values[[l]])
+        if(meanperf$AvgPerf[2, 1]-meanperf$AvgPerf[1, 1]>0) print(paste("BBr threshold =", bbr_threshold_values[[i]], "; RVT threshold =", rvt_threshold_values[[j]], "; longshort =", longshort_values[[k]], "; Window Size =", w_size_values[[l]]))
+        if(meanperf$AvgPerf[2, 1]-meanperf$AvgPerf[1, 1]>0) print(paste("Excess return =", meanperf$AvgPerf[2, 1]-meanperf$AvgPerf[1, 1]))
+      }
+    }
+  }
+}
+```
+
+Compute Google volatility.
+
+```{r}
+x <- read.csv('dataSent/GOOG.csv', sep = ",", header = TRUE)
+x<-x[,-1]
+goog_ohlc <-x[,c("Open","High","Low","Close")]
+goog_volatility <- TTR::volatility(goog_ohlc, n=20, calc="close",N=252)
+```
+
+Compute Microsoft volatility.
+
+```{r}
+x <- read.csv('dataSent/MSFT.csv', sep = ",", header = TRUE)
+x<-x[,-1]
+msft_ohlc <-x[,c("Open","High","Low","Close")]
+msft_volatility <- TTR::volatility(msft_ohlc, n=20, calc="close",N=252)
+```
+
+Rolling window analysis for BBr-based strategy with volatility:
+
+```{r}
+RollingTestBBrVolStrategy <- function(myStock, BBr, RVT, volatility, bbr_threshold = 1, rvt_threshold = 0, volatility_threshold = 0, longshort = 0, w_size = 252) {
+  # Generate signals based on Bull-Bear ratio threshold
+  myPosition <- sig <- Lag(ifelse(BBr > bbr_threshold & RVT > rvt_threshold & volatility > volatility_threshold, 1, ifelse(BBr < (1/bbr_threshold), -1, longshort)), 1)
+  
+  # Calculate returns
+  bmkReturns <- dailyReturn(myStock, type = "arithmetic")
+  myReturns <- bmkReturns * myPosition
+  
+  # Rename columns
+  names(bmkReturns) <- 'BH'
+  names(myReturns) <- 'BBr'
+  
+  # Merge returns and remove NA values
+  tt <- na.omit(merge(bmkReturns, myReturns))
+  
+  n_windows = nrow(tt) - w_size
+  if (n_windows < 1) stop("Window size too large")
+  
+  # Perform rolling window analysis
+  perform = foreach(i = 1:n_windows, .combine = rbind) %do% {
+    bhStra = tt$BH[i:(w_size + i - 1), ]
+    bbrStra = tt$BBr[i:(w_size + i - 1), ]
+    per = rbind(BH = Performance(bhStra), BBr = Performance(bbrStra))
+    return(per)
+  }
+  
+  bhindx = seq(1, 2 * n_windows, 2)
+  bbrindx = seq(2, 2 * n_windows, 2)
+  BHmeans = colMeans(perform[bhindx, ])
+  BBrMeans = colMeans(perform[bbrindx, ])
+  MeanPerf = rbind(BHmeans, BBrMeans)
+  colnames(MeanPerf) = colnames(perform)
+  rownames(MeanPerf) = c("BH", "BBr")
+  
+  return(list("AvgPerf" = MeanPerf, "NumWindows" = n_windows))
+}
+```
+
+Define volatility hyper parameter:
+
+```{r}
+volatility_threshold_values <- list(0, 0.1, 0.2)
+```
+
+Average Performance of BBr over fixed length periods (window_size= 1 yr, 6 mon) using Rolling windows for Google.
+
+```{r}
+##Full period test for each hyperparameter combination
+for (i in seq_along(bbr_threshold_values)) {
+  for (j in seq_along(rvt_threshold_values)) {
+    for (k in seq_along(volatility_threshold_values)) {
+      for (l in seq_along(longshort_values)) {
+        for (m in seq_along(w_size_values)) {
+          meanperf <- RollingTestBBrVolStrategy(goog_target, goog_BBr, goog_RVT, goog_volatility, bbr_threshold = bbr_threshold_values[[i]], rvt_threshold = rvt_threshold_values[[j]], volatility_threshold = volatility_threshold_values[[k]], longshort = longshort_values[[l]], w_size = w_size_values[[m]])
+          if(meanperf$AvgPerf[2, 1]-meanperf$AvgPerf[1, 1]>0) print(paste("BBr threshold =", bbr_threshold_values[[i]], "; RVT threshold =", rvt_threshold_values[[j]], "; Volatility threshold =", volatility_threshold_values[[k]], "; longshort =", longshort_values[[l]], "; Window Size =", w_size_values[[m]]))
+          if(meanperf$AvgPerf[2, 1]-meanperf$AvgPerf[1, 1]>0) print(paste("Excess return =", meanperf$AvgPerf[2, 1]-meanperf$AvgPerf[1, 1]))
+        }
+      }
+    }
+  }
+}
+```

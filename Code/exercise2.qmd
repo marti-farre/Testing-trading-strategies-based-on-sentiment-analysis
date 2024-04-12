@@ -1,0 +1,265 @@
+---
+title: "exercise2"
+format: html
+editor: visual
+---
+
+## Code
+
+Set working directory to current script's location:
+
+```{r}
+fileloc <- dirname(rstudioapi::getSourceEditorContext()$path)
+setwd(fileloc)
+rm(fileloc)
+```
+
+Import libraries:
+
+```{r}
+library(xts)
+library(zoo)
+library(quantmod) # data, plotting, quant modelling
+library(PerformanceAnalytics) # performance and risk management
+library(matrixStats)
+library(doParallel)
+library(forecast)
+library(ggplot2)
+```
+
+Load and setup data:
+
+```{r}
+##frequency of sampling
+tau=1 #data is daily. Try tau=20 (month), tau=60 (quarterly)
+x <- read.csv('dataSent/GOOG.csv', sep = ",", header = TRUE)
+x<-x[,-1]
+
+##use Date as index
+data <- as.xts(zoo(as.matrix(x[,-1]), as.Date(as.character(x[,1]))))
+start_date <- as.Date("2018-01-02")
+end_date <- as.Date("2019-12-31")
+data <- subset(data, index(data) >= start_date & index(data) <= end_date)
+# data
+
+## Target :  Adj.Close Price 
+# target <- data$Adj.Close
+# names(target) <- "GOOG"
+# target
+```
+
+We create 30 replicas of our target variable
+
+```{r}
+set.seed(123)
+ts_target <- data[, 5]
+
+n_replicas <- 30
+n_periods <- length(ts_target)
+target_replicas <- matrix(0, nrow = n_periods, ncol = n_replicas)
+
+best_arima <- function(data){
+  best_model <- list(order = c(0,0,0), aic = Inf)
+  for(p in 0:3){
+    for(d in 0:1){
+      for(q in 0:3){
+        model <- tryCatch(
+          auto.arima(data, seasonal = FALSE, order = c(p,d,q), stepwise = FALSE), 
+          error = function(e) NULL
+        )
+        if (!is.null(model) && model$aic < best_model$aic){
+          best_model$order <- model$order
+          best_model$aic <- model$aic
+        }
+      }
+    }
+  }
+  return(best_model)
+}
+
+arima_model <- best_arima(ts_target)
+
+for(i in 1:n_replicas){
+  replica <- arima.sim(list(order = arima_model$order), n = n_periods)
+  target_replicas[, i] <- cumsum(replica) + ts_target
+}
+```
+
+Let's plot the original variable and an example of the replicas
+
+```{r}
+
+time <- seq(as.Date("2018-01-02"), by = "day", length.out = length(ts_target))
+
+ggplot() +
+  geom_line(aes(x = time, y = ts_target, color = "Original")) +
+  geom_line(aes(x = time, y = target_replicas[, 13], color = "New Series")) +
+  labs(title = "Original vs Replicated Data",
+       x = "Time",
+       y = "Stock Vaue") +
+  scale_color_manual(values = c("Original" = "blue", "New Series" = "red")) +
+  theme_minimal()
+```
+
+Indicators for use in trade-signals:
+
+```{r}
+# Bearish sentiment indicators
+negativeP= na.omit(data$negativePartscr)
+names(negativeP)<- "negative"
+uncertaintyP= na.omit(data$uncertaintyPartscr)
+findownP= na.omit(data$findownPartscr)
+
+## Bullish sentiment indicators
+positiveP= na.omit(data$positivePartscr)
+names(positiveP)<- "positive"
+certaintyP= na.omit(data$certaintyPartscr)
+finupP= na.omit(data$finupPartscr)
+
+##Combinations
+BULL = .33*(positiveP+certaintyP+finupP); 
+BEAR= .33*(negativeP+uncertaintyP+findownP); 
+names(BULL)<-"BULL"; names(BEAR)<-"BEAR"
+# Bull-Bear ratio: NAs are interpolated with  leftmost and rightmost non-NA value
+##(NAs can be produced when BULL=BEAR=0)
+BBr<- na.fill(100*BULL/(BULL+BEAR),"extend")
+names(BBr)<-"BBr"
+# BBlog<- 0.5*log((BULL+1)/(BEAR+1))
+
+#PNr <-na.fill(100*positiveP/(positiveP+negativeP),"extend")
+PNlog<- 0.5*log((positiveP+1)/(negativeP+1))
+names(PNlog)<-"PNlog"
+
+RVT = na.omit(RVT)
+names(RVT)<-"RVT"
+```
+
+Performance Measures for Trading strategies:
+
+```{r}
+Performance <- function(x,ntrades=1,cost=0) {
+  cumRetx = Return.cumulative(x,geometric = TRUE) -ntrades*cost
+  #annRetx = Return.annualized(x, scale=252,geometric = T) -ntrades*cost
+  annRetx = (cumRetx +1)^{252/length(x)} -1
+  #sharpex = SharpeRatio.annualized(x, scale=252)
+  sharpex = annRetx/sd.annualized(x,scale=252)
+  winpctx = length(x[x > 0])/length(x[x != 0])
+  annSDx = sd.annualized(x, scale=252)
+  DDs <- findDrawdowns(x)
+  maxDDx = min(DDs$return)
+  maxLx = max(DDs$length)
+  
+  Perf = c(cumRetx, annRetx, sharpex, winpctx, annSDx, maxDDx, maxLx, ntrades)
+  names(Perf) = c("Cumulative Return", "Annual Return","Annualized Sharpe Ratio","Win %", 
+                  "Annualized Volatility", "Maximum Drawdown", "Max Length Drawdown","n.trades")
+  return(Perf)
+}
+```
+
+BBr-based strategy:
+
+```{r}
+testBBrStrategy <- function(myStock, BBr, RVT, bbr_threshold = 1, rvt_threshold = 0, longshort = 0, tcost = 0) {
+  
+  # Generate signals based on Bull-Bear ratio threshold
+  myPosition <- sig <- Lag(ifelse(BBr > bbr_threshold & RVT > rvt_threshold, 1, ifelse(BBr < (1/bbr_threshold), -1, longshort)), 1)
+
+# Calculate returns
+  bmkReturns <- dailyReturn(myStock, type = "arithmetic")
+  myReturns <- bmkReturns * myPosition
+  
+  # Rename columns
+  names(bmkReturns) <- 'BH'
+  names(myReturns) <- 'BBr'
+  
+  # Merge returns and remove NA values
+  tt <- na.omit(merge(bmkReturns, myReturns))
+  
+  # Calculate performance
+  cbind(BBr = Performance(tt$BBr, cost = tcost), BH = Performance(tt$BH, 2, tcost))
+}
+```
+
+Rolling window analysis for BBr-based strategy.
+
+```{r}
+RollingTestBBrStrategy <- function(myStock, ts = myStock, bbr_threshold = 1, longshort = 0, w_size = 252) {
+  # Generate signals based on Bull-Bear ratio threshold
+  myPosition <- sig <- Lag(ifelse(BBr > bbr_threshold, 1, ifelse(BBr < (1/bbr_threshold), -1, longshort)), 1)
+  
+  # Calculate returns
+  bmkReturns <- dailyReturn(myStock, type = "arithmetic")
+  myReturns <- bmkReturns * sig
+  
+  # Rename columns
+  names(bmkReturns) <- 'BH'
+  names(myReturns) <- 'BBr'
+  
+  # Merge returns and remove NA values
+  tt <- na.omit(merge(bmkReturns, myReturns))
+  
+  n_windows = nrow(tt) - w_size
+  if (n_windows < 1) stop("Window size too large")
+  
+  # Perform rolling window analysis
+  perform = foreach(i = 1:n_windows, .combine = rbind) %do% {
+    bhStra = tt$BH[i:(w_size + i - 1), ]
+    bbrStra = tt$BBr[i:(w_size + i - 1), ]
+    per = rbind(BH = Performance(bhStra), BBr = Performance(bbrStra))
+    return(per)
+  }
+  
+  bhindx = seq(1, 2 * n_windows, 2)
+  bbrindx = seq(2, 2 * n_windows, 2)
+  BHmeans = colMeans2(perform, rows = bhindx)
+  BBrMeans = colMeans2(perform, rows = bbrindx)
+  MeanPerf = rbind(BHmeans, BBrMeans)
+  colnames(MeanPerf) = colnames(perform)
+  rownames(MeanPerf) = c("BH", "BBr")
+  
+  return(list("AvgPerf" = MeanPerf, "NumWindows" = n_windows))
+}
+```
+
+Test Performance of Trading strategy against BH.
+
+```{r}
+excess_return <- c()
+successful_run <- c()
+##Full period test for each ev with longshort=0,-1, tcost=0,0.01,0.05
+for(r in 1: n_replicas){
+  up_target <- target_replicas[, r]
+  new_data <- merge(data, up_target)
+  target<-new_data$up_target
+  names(target) <- "GOOG"
+  res <- testBBrStrategy(target, BBr, RVT, bbr_threshold = 25, rvt_threshold = 0, longshort = 0, tcost = 0.05)
+  excess_return <-c(excess_return, res[1] - res[9])
+  if (res[1] - res[9] > 0) {
+      successful_run <- c(successful_run, 1)
+    } else {
+      successful_run <- c(successful_run, 0)
+    }
+}
+```
+
+```{r}
+sum(successful_run)/length(successful_run)
+```
+
+```{r}
+sum(excess_return)/length(excess_return)
+```
+
+Average Performance of MA crossover over fixed length periods (window_size= 1 yr, 6 mon) using Rolling windows.
+
+```{r}
+# Window size 252 (a year of daily data) or 252/2 for 6 mon
+##Number of windows = full_period - window_size
+# meanperf = RollingTestMAStrategy(myStock=target,ts =ev,s=10, m=25,longshort=-1,w_size=252/2)
+meanperf = RollingTestBBrStrategy(myStock=target, ts=ev, bbr_threshold = 1, longshort = -1, w_size = 252)
+View(meanperf$AvgPerf)  
+meanperf$NumWindows
+meanperf = RollingTestBBrStrategy(myStock=target, ts=ev, bbr_threshold = 1, longshort = -1, w_size = 252/2)
+View(meanperf$AvgPerf)  
+meanperf$NumWindows
+```
